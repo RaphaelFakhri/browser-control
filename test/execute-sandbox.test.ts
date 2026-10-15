@@ -3,7 +3,15 @@ import { PNG } from "pngjs"
 import { Effect, Fiber, Latch } from "effect"
 import { TestClock } from "effect/testing"
 import { beforeEach, describe, expect, it, vi } from "vitest"
-import { defaultPageReplacedWarning, ExecuteSandbox, type RequestHandoff } from "../src/execute.ts"
+import {
+  closedDefaultPageBlankErrorMessage,
+  defaultActionTimeoutMs,
+  defaultNavigationTimeoutMs,
+  defaultPageClosedWarning,
+  defaultPageReplacedWarning,
+  ExecuteSandbox,
+  type RequestHandoff,
+} from "../src/execute.ts"
 import { awaitHandoffAction } from "../src/handoff.ts"
 import { BrowserControlSessions } from "../src/session-manager.ts"
 
@@ -21,6 +29,16 @@ vi.mock("playwright-core", () => ({
 class FakePage extends EventEmitter {
   title = async () => "Fixture"
   closed = false
+  currentUrl: string
+  readonly setDefaultTimeout = vi.fn()
+  readonly setDefaultNavigationTimeout = vi.fn()
+  readonly goto = vi.fn(async (nextUrl: string) => {
+    this.currentUrl = nextUrl
+    this.emit("framenavigated", this.frame)
+  })
+  readonly locator = vi.fn(() => ({
+    click: vi.fn(async () => "clicked"),
+  }))
   readonly screenshot = vi.fn(async () => PNG.sync.write(new PNG({ width: 2, height: 2 })))
   readonly frame = { url: () => this.url() }
   readonly evaluate = vi.fn(async (): Promise<unknown> => {
@@ -35,10 +53,11 @@ class FakePage extends EventEmitter {
 
   constructor(readonly targetId: string, private readonly owner: FakeContext, readonly href = "https://example.test/page") {
     super()
+    this.currentUrl = href
   }
 
   context() { return this.owner }
-  url() { return this.href }
+  url() { return this.currentUrl }
   isClosed() { return this.closed }
   mainFrame() { return this.frame }
 }
@@ -578,5 +597,108 @@ describe("ExecuteSandbox", () => {
       expect(page.close).not.toHaveBeenCalled()
       expect(page.eventNames()).toEqual([])
     }).pipe(Effect.provide(TestClock.layer())))
+  })
+
+  it("sets default action timeout to 8000ms and navigation timeout to 30000ms without overwriting caller overrides", async () => {
+    const context = new FakeContext()
+    connect(context)
+    const sandbox = new ExecuteSandbox({ endpointUrl: "http://relay.test" })
+    try {
+      expect(await Effect.runPromise(sandbox.execute("page.setDefaultTimeout(15000); return page.url()"))).toMatchObject({
+        isError: false,
+      })
+      const page = context.targets[0]
+      if (!page) throw new Error("Expected a default page")
+      expect(page.setDefaultTimeout.mock.calls).toEqual([[defaultActionTimeoutMs], [15_000]])
+      expect(page.setDefaultNavigationTimeout).toHaveBeenCalledWith(defaultNavigationTimeoutMs)
+
+      expect(await Effect.runPromise(sandbox.execute("return page.url()"))).toMatchObject({ isError: false })
+      expect(page.setDefaultTimeout.mock.calls).toEqual([[defaultActionTimeoutMs], [15_000]])
+    } finally {
+      await Effect.runPromise(sandbox.closeSettled())
+    }
+  })
+
+  it("fails locator actions and snapshot() immediately on a replacement about:blank after the default page closes until page.goto()", async () => {
+    const context = new FakeContext()
+    connect(context)
+    const sandbox = new ExecuteSandbox({ endpointUrl: "http://relay.test" })
+    try {
+      expect(await Effect.runPromise(sandbox.execute("return page.url()"))).toMatchObject({
+        isError: false,
+        value: "https://example.test/page",
+      })
+      const original = context.targets[0]
+      if (!original) throw new Error("Expected original page")
+      context.newPage.mockImplementationOnce(async () => context.addPage("replacement-blank", "about:blank"))
+      expect(sandbox.markTargetDetached(original.targetId)).toBe(true)
+
+      const locatorFailed = await Effect.runPromise(sandbox.execute('await page.locator("#submit").click()'))
+      expect(locatorFailed).toMatchObject({
+        isError: true,
+        text: expect.stringContaining(closedDefaultPageBlankErrorMessage),
+        warnings: expect.arrayContaining([defaultPageClosedWarning]),
+      })
+
+      const snapshotFailed = await Effect.runPromise(sandbox.execute("return await snapshot()"))
+      expect(snapshotFailed).toMatchObject({
+        isError: true,
+        text: expect.stringContaining(closedDefaultPageBlankErrorMessage),
+      })
+
+      const replacement = context.targets[1]
+      if (!replacement) throw new Error("Expected replacement page")
+      replacement.evaluate.mockResolvedValue({
+        entries: [{ depth: 0, role: "button", name: "Submit", identityName: "Submit", selector: "#submit" }],
+        truncated: false,
+      })
+
+      const navigated = await Effect.runPromise(
+        sandbox.execute('await page.goto("https://example.test/reopened"); return { clicked: await page.locator("#submit").click(), snap: await snapshot() }'),
+      )
+      expect(navigated).toMatchObject({
+        isError: false,
+        value: {
+          clicked: "clicked",
+          snap: '- button "Submit" [ref=e1]',
+        },
+      })
+    } finally {
+      await Effect.runPromise(sandbox.closeSettled())
+    }
+  })
+
+  it("supports await fs.readFile/writeFile, fsp, sync fs, and callback fs in execute", async () => {
+    const context = new FakeContext()
+    connect(context)
+    const sandbox = new ExecuteSandbox({ endpointUrl: "http://relay.test" })
+    try {
+      const result = await Effect.runPromise(
+        sandbox.execute(`
+          const dir = await fs.mkdtemp(path.join(os.tmpdir(), "bc-fs-test-"))
+          const file = path.join(dir, "sample.txt")
+          await fs.writeFile(file, "hello")
+          const viaAwaitFs = await fs.readFile(file, "utf8")
+          const viaFsp = await fsp.readFile(file, "utf8")
+          const viaSync = fs.readFileSync(file, "utf8")
+          const viaCallback = await new Promise((resolve, reject) => {
+            fs.readFile(file, "utf8", (err, data) => (err ? reject(err) : resolve(data)))
+          })
+          await fs.rm(dir, { recursive: true, force: true })
+          return { viaAwaitFs, viaFsp, viaSync, viaCallback }
+        `),
+      )
+      expect(result).toMatchObject({
+        isError: false,
+        value: {
+          viaAwaitFs: "hello",
+          viaFsp: "hello",
+          viaSync: "hello",
+          viaCallback: "hello",
+        },
+      })
+    } finally {
+      await Effect.runPromise(sandbox.closeSettled())
+    }
   })
 })

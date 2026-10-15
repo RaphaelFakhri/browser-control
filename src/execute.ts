@@ -60,7 +60,31 @@ import { startDemonstrationRecorder, type DemonstrationResult } from "./demonstr
 
 export { createAriaSnapshotHelper, createSnapshotHelpers, defaultAriaSnapshotTimeoutMs, fillInputs }
 
-const nodeModules = { fs, path, os, crypto, url, util, events, stream, buffer, http, https, zlib }
+export const defaultActionTimeoutMs = 8_000
+export const defaultNavigationTimeoutMs = 30_000
+export const closedDefaultPageBlankErrorMessage =
+  "Session default page was closed and reset to about:blank; navigate with page.goto(...) or adopt a tab before querying elements"
+
+const sandboxFs: typeof fs = new Proxy(fs, {
+  get(target, prop, receiver) {
+    if (typeof prop === "string" && prop in fs.promises) {
+      const promiseFn = (fs.promises as unknown as Record<string, (...args: unknown[]) => unknown>)[prop]
+      const callbackFn = Reflect.get(target, prop, receiver)
+      if (typeof promiseFn === "function" && typeof callbackFn === "function") {
+        return (...args: unknown[]) => {
+          if (typeof args.at(-1) === "function") {
+            return (callbackFn as (...a: unknown[]) => unknown).apply(target, args)
+          }
+          return promiseFn.apply(fs.promises, args)
+        }
+      }
+    }
+    const value = Reflect.get(target, prop, receiver)
+    return typeof value === "function" ? value.bind(target) : value
+  },
+})
+
+const nodeModules = { fs: sandboxFs, fsp: fs.promises, path, os, crypto, url, util, events, stream, buffer, http, https, zlib }
 const nodeModuleAliases = Object.keys(nodeModules).join(", ")
 
 const playwrightCloseTimeoutMs = 2_000
@@ -76,6 +100,16 @@ export const downloadCapabilityErrorMessage = "Downloads are unavailable in Brow
 const downloadGuardedPages = new WeakSet<Page>()
 const downloadGuardedContexts = new WeakSet<BrowserContext>()
 const viewportZoomGuardedPages = new WeakSet<Page>()
+const defaultTimeoutConfiguredPages = new WeakSet<Page>()
+
+function installDefaultPageTimeouts(
+  page: Partial<Pick<Page, "setDefaultTimeout" | "setDefaultNavigationTimeout">> & object,
+): void {
+  if (defaultTimeoutConfiguredPages.has(page as Page)) return
+  defaultTimeoutConfiguredPages.add(page as Page)
+  page.setDefaultTimeout?.(defaultActionTimeoutMs)
+  page.setDefaultNavigationTimeout?.(defaultNavigationTimeoutMs)
+}
 
 class PlaywrightOperationError extends Schema.TaggedError<PlaywrightOperationError>()(
   "Execute.PlaywrightOperationError",
@@ -492,6 +526,7 @@ export class ExecuteSandbox {
   private pendingTargetRebind: "replaced" | "repaired" | undefined
   private lastKnownNonBlankUrl: string | undefined
   private recreatedFromClosedUrl: string | undefined
+  private closedDefaultPage = false
   private explicitLightColorScheme = false
   private readonly state: Record<string, unknown> = {}
   private readonly snapshotRefs: SnapshotRefRegistry = { selectors: new Map() }
@@ -697,6 +732,8 @@ export class ExecuteSandbox {
       const browser = sandbox.browser
       const ownsOpenPage = page !== undefined && sandbox.ownsPage && !page.isClosed()
       sandbox.browser = undefined
+      sandbox.closedDefaultPage = false
+      sandbox.recreatedFromClosedUrl = undefined
       sandbox.unbindDefaultPage(undefined, { notify: true })
       yield* sandbox.networkCapture.cancel()
 
@@ -737,6 +774,8 @@ export class ExecuteSandbox {
           run: () => currentPage.close(),
         })
       }
+      sandbox.closedDefaultPage = false
+      sandbox.recreatedFromClosedUrl = undefined
       sandbox.unbindDefaultPage(targetId)
     }).pipe(Effect.uninterruptible)
   }
@@ -807,6 +846,7 @@ export class ExecuteSandbox {
     const context = browser.contexts()[0] ?? (await browser.newContext())
     await registerAriaSnapshotSelector(context)
     installDownloadCapabilityGuards(context)
+    installDefaultTimeoutGuards(context)
     return { browser, context }
   }
 
@@ -845,9 +885,12 @@ export class ExecuteSandbox {
   }> {
     if (!this.page && !this.defaultPageTargetId && !hasExplicitTargetSelection(targetSelection) && requestTabHint && this.options.requestTabAttach) {
       const { targetId } = await this.options.requestTabAttach(requestTabHint)
+      this.closedDefaultPage = false
+      this.recreatedFromClosedUrl = undefined
       this.unbindDefaultPage(targetId, { ownsPage: false, notify: true })
       const { browser, context } = await this.connectContext()
       const page = await this.getSessionPage({ context })
+      installDefaultPageTimeouts(page)
       installPageReadTimeout(page)
       this.installViewportZoomGuard(page)
       this.networkCapture.bindPage(page)
@@ -863,6 +906,7 @@ export class ExecuteSandbox {
       ;({ browser, context } = await this.connectContext())
       page = await this.getSessionPage({ context, ...(targetSelection ? { targetSelection } : {}) })
     }
+    installDefaultPageTimeouts(page)
     installPageReadTimeout(page)
     this.installViewportZoomGuard(page)
     this.networkCapture.bindPage(page)
@@ -890,8 +934,20 @@ export class ExecuteSandbox {
     const hideGhostCursor = async (options?: HideGhostCursorOptions) => {
       await hideGhostCursorOnPage({ page: options?.page ?? page })
     }
-    const ariaSnapshot = createAriaSnapshotHelper(page)
-    const { snapshot, ref } = createSnapshotHelpers(page, this.snapshotRefs)
+    const rawAriaSnapshot = createAriaSnapshotHelper(page)
+    const ariaSnapshot: AriaSnapshotHelper = async (target, ariaOptions) => {
+      this.assertNotClosedReplacementBlankPage(page)
+      return await rawAriaSnapshot(target, ariaOptions)
+    }
+    const { snapshot: rawSnapshot, ref: rawRef } = createSnapshotHelpers(page, this.snapshotRefs)
+    const snapshot: SnapshotHelper = async (snapshotOptions) => {
+      this.assertNotClosedReplacementBlankPage(page)
+      return await rawSnapshot(snapshotOptions)
+    }
+    const ref: SnapshotRefHelper = (id) => {
+      this.assertNotClosedReplacementBlankPage(page)
+      return rawRef(id)
+    }
     const handoffTracker = { count: 0 }
     const requestHandoff = this.options.requestHandoff
     const handoff = async (message?: string, options?: HandoffCallOptions) => {
@@ -977,6 +1033,9 @@ export class ExecuteSandbox {
       if (shouldClosePrevious && previousPage && previousPage !== matched) {
         await previousPage.close().catch(() => {})
       }
+      this.closedDefaultPage = false
+      this.recreatedFromClosedUrl = undefined
+      installDefaultPageTimeouts(matched)
       this.bindDefaultPage(matched, targetId, false, true)
       return matched
     }
@@ -986,13 +1045,23 @@ export class ExecuteSandbox {
       page,
       state: this.state,
       modules: nodeModules,
-      fillInput: (target, value) => fillInput({ page, target, value }),
-      fillInputs,
-      screenshotWithLabels: (screenshotOptions = {}) => screenshotWithLabels({
-        ...screenshotOptions,
-        page: screenshotOptions.page ?? page,
-        registry: this.snapshotRefs,
-      }),
+      fillInput: async (target, value) => {
+        this.assertNotClosedReplacementBlankPage(page)
+        await fillInput({ page, target, value })
+      },
+      fillInputs: async (targetPage, fields) => {
+        this.assertNotClosedReplacementBlankPage(targetPage)
+        await fillInputs(targetPage, fields)
+      },
+      screenshotWithLabels: async (screenshotOptions = {}) => {
+        const targetPage = screenshotOptions.page ?? page
+        this.assertNotClosedReplacementBlankPage(targetPage)
+        return await screenshotWithLabels({
+          ...screenshotOptions,
+          page: targetPage,
+          registry: this.snapshotRefs,
+        })
+      },
       screenshotDiff: createScreenshotDiff(page),
       ariaSnapshot,
       snapshot,
@@ -1075,6 +1144,7 @@ export class ExecuteSandbox {
     if (this.defaultPageTargetId !== targetId) {
       return false
     }
+    this.closedDefaultPage = true
     if (this.lastKnownNonBlankUrl) {
       this.recreatedFromClosedUrl = this.lastKnownNonBlankUrl
     }
@@ -1087,6 +1157,8 @@ export class ExecuteSandbox {
 
   markTargetReplaced(previousTargetId: string, targetId: string): boolean {
     if (this.defaultPageTargetId !== previousTargetId) return false
+    this.closedDefaultPage = false
+    this.recreatedFromClosedUrl = undefined
     this.unbindDefaultPage(targetId, {
       ownsPage: this.ownsPage,
       rebind: "replaced",
@@ -1095,6 +1167,8 @@ export class ExecuteSandbox {
   }
 
   restore(target: SessionTarget | undefined): void {
+    this.closedDefaultPage = false
+    this.recreatedFromClosedUrl = undefined
     if (target) {
       this.unbindDefaultPage(target.id, { ownsPage: target.owner === "relay" })
     }
@@ -1111,6 +1185,17 @@ export class ExecuteSandbox {
     if (url && url !== "about:blank" && !url.startsWith("chrome-error://")) {
       this.lastKnownNonBlankUrl = url
       this.recreatedFromClosedUrl = undefined
+      this.closedDefaultPage = false
+    }
+  }
+
+  private isClosedReplacementBlankPage(page: Page): boolean {
+    return this.closedDefaultPage && this.page === page && (safePageUrl(page) ?? "about:blank") === "about:blank"
+  }
+
+  private assertNotClosedReplacementBlankPage(page: Page): void {
+    if (this.isClosedReplacementBlankPage(page)) {
+      throw new Error(closedDefaultPageBlankErrorMessage)
     }
   }
 
@@ -1122,12 +1207,17 @@ export class ExecuteSandbox {
       this.pageProtectedUi = false
       this.explicitLightColorScheme = false
     }
+    if (!ownsPage) {
+      this.closedDefaultPage = false
+      this.recreatedFromClosedUrl = undefined
+    }
     this.defaultPageTargetId = targetId
     this.ownsPage = ownsPage
     this.pendingTargetRebind = undefined
     this.recordNonBlankUrl(safePageUrl(page))
     const close = () => {
       if (this.page !== page) return
+      this.closedDefaultPage = true
       if (this.lastKnownNonBlankUrl) {
         this.recreatedFromClosedUrl = this.lastKnownNonBlankUrl
       }
@@ -1136,14 +1226,19 @@ export class ExecuteSandbox {
         pageProtectedUi: this.pageProtectedUi,
         notify: true,
       })
+      if (!this.pendingWarnings.includes(defaultPageClosedWarning)) {
+        this.pendingWarnings.push(defaultPageClosedWarning)
+      }
     }
     const navigate = (frame: Frame) => {
       if (this.page === page && frame === page.mainFrame()) {
         this.pageCrashed = false
-        const hadClosedReplacementGuard = this.recreatedFromClosedUrl !== undefined
+        const hadClosedReplacementGuard = this.closedDefaultPage || this.recreatedFromClosedUrl !== undefined
+        this.closedDefaultPage = false
+        this.recreatedFromClosedUrl = undefined
         this.recordNonBlankUrl(frame.url())
         if (hadClosedReplacementGuard) {
-          page.setDefaultTimeout?.(30_000)
+          page.setDefaultTimeout?.(defaultActionTimeoutMs)
         }
         if (this.explicitLightColorScheme) {
           void this.applyExplicitLightColorScheme(page)
@@ -1270,6 +1365,7 @@ export class ExecuteSandbox {
       }
     }
     if (this.page?.isClosed()) {
+      this.closedDefaultPage = true
       if (this.lastKnownNonBlankUrl) {
         this.recreatedFromClosedUrl = this.lastKnownNonBlankUrl
       }
@@ -1278,23 +1374,26 @@ export class ExecuteSandbox {
         pageProtectedUi: this.pageProtectedUi,
         notify: true,
       })
-      this.pendingWarnings.push(defaultPageClosedWarning)
+      if (!this.pendingWarnings.includes(defaultPageClosedWarning)) {
+        this.pendingWarnings.push(defaultPageClosedWarning)
+      }
     }
     const page = await context.newPage()
     const targetId = await resolvePageTargetId(page)
     this.bindDefaultPage(page, targetId, true, true)
-    if (this.recreatedFromClosedUrl) {
+    if (this.closedDefaultPage || this.recreatedFromClosedUrl) {
       this.installClosedPageReplacementGuard(page)
     }
     return page
   }
 
   private installClosedPageReplacementGuard(page: Page): void {
-    page.setDefaultTimeout?.(2_500)
     const restoreTimeout = () => {
+      this.closedDefaultPage = false
       this.recreatedFromClosedUrl = undefined
-      page.setDefaultTimeout?.(30_000)
+      page.setDefaultTimeout?.(defaultActionTimeoutMs)
     }
+    const isBlocked = () => this.isClosedReplacementBlankPage(page)
     if (typeof page.reload === "function" && typeof page.goto === "function") {
       const originalReload = page.reload.bind(page)
       const originalGoto = page.goto.bind(page)
@@ -1310,23 +1409,45 @@ export class ExecuteSandbox {
         },
       })
     }
-    if (typeof page.goto === "function") {
-      const originalGoto = page.goto.bind(page)
-      Object.defineProperty(page, "goto", {
+    for (const navMethod of ["goto", "setContent", "goBack", "goForward"] as const) {
+      const originalNav = page[navMethod]
+      if (typeof originalNav === "function") {
+        const boundNav = originalNav.bind(page) as (...args: unknown[]) => Promise<unknown>
+        Object.defineProperty(page, navMethod, {
+          configurable: true,
+          value: async (...args: unknown[]) => {
+            restoreTimeout()
+            return await boundNav(...args)
+          },
+        })
+      }
+    }
+    for (const locatorMethod of locatorFactoryMethods) {
+      const originalFactory = (page as unknown as Record<string, unknown>)[locatorMethod]
+      const boundFactory = typeof originalFactory === "function"
+        ? (originalFactory as (...args: unknown[]) => unknown).bind(page)
+        : undefined
+      Object.defineProperty(page, locatorMethod, {
         configurable: true,
-        value: async (...args: Parameters<Page["goto"]>) => {
-          restoreTimeout()
-          return await originalGoto(...args)
+        value: (...args: unknown[]) => {
+          const target = boundFactory ? boundFactory(...args.map(unwrapLocatorArg)) : {}
+          return wrapLocatorWithClosedPageGuard(target, isBlocked)
         },
       })
     }
-    if (typeof page.setContent === "function") {
-      const originalSetContent = page.setContent.bind(page)
-      Object.defineProperty(page, "setContent", {
+    for (const actionMethod of pageSelectorActionMethods) {
+      const originalAction = (page as unknown as Record<string, unknown>)[actionMethod]
+      const boundAction = typeof originalAction === "function"
+        ? (originalAction as (...args: unknown[]) => unknown).bind(page)
+        : undefined
+      if (!boundAction) continue
+      Object.defineProperty(page, actionMethod, {
         configurable: true,
-        value: async (...args: Parameters<Page["setContent"]>) => {
-          restoreTimeout()
-          return await originalSetContent(...args)
+        value: (...args: unknown[]) => {
+          if (isBlocked()) {
+            return Promise.reject(new Error(closedDefaultPageBlankErrorMessage))
+          }
+          return boundAction(...args)
         },
       })
     }
@@ -1749,6 +1870,128 @@ export function installDownloadCapabilityGuard(page: Page): void {
     },
   })
   downloadGuardedPages.add(page)
+}
+
+const defaultTimeoutContexts = new WeakSet<BrowserContext>()
+const rawLocatorSymbol = Symbol("raw-locator")
+const locatorFactoryMethods = [
+  "locator",
+  "getByRole",
+  "getByText",
+  "getByLabel",
+  "getByPlaceholder",
+  "getByAltText",
+  "getByTitle",
+  "getByTestId",
+  "frameLocator",
+] as const
+const locatorChainMethods = new Set<string>([
+  ...locatorFactoryMethods,
+  "first",
+  "last",
+  "nth",
+  "filter",
+  "and",
+  "or",
+  "contentFrame",
+  "describe",
+])
+const pageSelectorActionMethods = [
+  "click",
+  "dblclick",
+  "fill",
+  "type",
+  "press",
+  "check",
+  "uncheck",
+  "setChecked",
+  "selectOption",
+  "hover",
+  "tap",
+  "focus",
+  "textContent",
+  "innerText",
+  "innerHTML",
+  "inputValue",
+  "getAttribute",
+  "isVisible",
+  "isHidden",
+  "isEnabled",
+  "isDisabled",
+  "isEditable",
+  "isChecked",
+  "waitForSelector",
+  "dispatchEvent",
+  "setInputFiles",
+  "$",
+  "$$",
+  "$eval",
+  "$$eval",
+] as const
+
+function unwrapLocatorArg(arg: unknown): unknown {
+  if (!arg || typeof arg !== "object") return arg
+  if (rawLocatorSymbol in arg) return (arg as { [rawLocatorSymbol]: unknown })[rawLocatorSymbol]
+  if (Array.isArray(arg)) return arg.map(unwrapLocatorArg)
+  if (Object.getPrototypeOf(arg) === Object.prototype) {
+    const record = arg as Record<string, unknown>
+    if ("has" in record || "hasNot" in record) {
+      return {
+        ...record,
+        ...("has" in record ? { has: unwrapLocatorArg(record.has) } : {}),
+        ...("hasNot" in record ? { hasNot: unwrapLocatorArg(record.hasNot) } : {}),
+      }
+    }
+  }
+  return arg
+}
+
+function wrapLocatorWithClosedPageGuard(target: unknown, isBlocked: () => boolean): unknown {
+  if (!target || typeof target !== "object") return target
+  return new Proxy(target as Record<PropertyKey, unknown>, {
+    get(obj, prop) {
+      if (prop === rawLocatorSymbol) return obj
+      if (prop === "then") return undefined
+      const value = Reflect.get(obj, prop, obj)
+      if (typeof prop === "symbol") {
+        return typeof value === "function" ? value.bind(obj) : value
+      }
+      if (prop === "page" || prop === "toString" || prop === "valueOf") {
+        return typeof value === "function" ? value.bind(obj) : value
+      }
+      if (locatorChainMethods.has(prop)) {
+        return (...args: unknown[]) => {
+          const next = typeof value === "function"
+            ? (value as (...a: unknown[]) => unknown).apply(obj, args.map(unwrapLocatorArg))
+            : {}
+          return wrapLocatorWithClosedPageGuard(next, isBlocked)
+        }
+      }
+      if (typeof value === "function" || isBlocked()) {
+        return (...args: unknown[]) => {
+          if (isBlocked()) {
+            return Promise.reject(new Error(closedDefaultPageBlankErrorMessage))
+          }
+          if (typeof value === "function") {
+            return (value as (...a: unknown[]) => unknown).apply(obj, args.map(unwrapLocatorArg))
+          }
+          return undefined
+        }
+      }
+      return value
+    },
+  })
+}
+
+function installDefaultTimeoutGuards(context: BrowserContext): void {
+  if (defaultTimeoutContexts.has(context)) {
+    return
+  }
+  for (const page of context.pages()) {
+    installDefaultPageTimeouts(page)
+  }
+  context.on("page", installDefaultPageTimeouts)
+  defaultTimeoutContexts.add(context)
 }
 
 export function installDownloadCapabilityGuards(context: BrowserContext): void {

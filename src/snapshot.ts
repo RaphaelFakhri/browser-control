@@ -1201,13 +1201,43 @@ export function createSnapshotHelpers(page: Page, registry: SnapshotRefRegistry)
       `const __name = (target) => target
 return (${capture.toString()})(rootOrSettings, locatorSettings)`,
     ) as typeof capture
-    const timeoutMs = options.timeout ?? defaultSnapshotTimeoutMs
+        const timeoutMs = options.timeout ?? defaultSnapshotTimeoutMs
+    const deadline = Date.now() + timeoutMs
+    const waitForNavigationSettle = async () => {
+      const remainingMs = Math.max(100, Math.min(1_500, deadline - Date.now()))
+      await page.waitForLoadState?.("domcontentloaded", { timeout: remainingMs }).catch(() => {})
+      if (Date.now() + snapshotRetryDelayMs < deadline) {
+        await delay(snapshotRetryDelayMs)
+      }
+    }
     let result: Awaited<ReturnType<typeof capture>>
     if (locator) {
-      result = await locator.evaluate(browserCapture, settings, { timeout: timeoutMs })
+      let locatorNavigationRetries = 0
+      while (true) {
+        navigatedDuringCapture = false
+        try {
+          result = await locator.evaluate(browserCapture, settings, { timeout: Math.max(100, deadline - Date.now()) })
+          if (navigatedDuringCapture && !options.diff && locatorNavigationRetries < 2 && Date.now() + snapshotRetryDelayMs < deadline) {
+            locatorNavigationRetries++
+            await waitForNavigationSettle()
+            continue
+          }
+          break
+        } catch (error) {
+          const kind = runtimeFailureKind(error)
+          if ((kind === "context-destroyed" || kind === "context-missing") && !options.diff && locatorNavigationRetries < 2 && Date.now() + snapshotRetryDelayMs < deadline) {
+            locatorNavigationRetries++
+            await waitForNavigationSettle()
+            continue
+          }
+          removeNavigationListener()
+          delete registry.removeNavigationListener
+          throw error
+        }
+      }
     } else {
-      const deadline = Date.now() + timeoutMs
-      let captureAttempts = 0
+      let navigationRetries = 0
+      let settleAttempts = 0
       while (true) {
         navigatedDuringCapture = false
         try {
@@ -1216,12 +1246,14 @@ return (${capture.toString()})(rootOrSettings, locatorSettings)`,
             timeoutMs: Math.max(100, deadline - Date.now()),
             run: () => page.evaluate(browserCapture, settings),
           }))
-          if (navigatedDuringCapture && !options.diff && ++captureAttempts < 3 && Date.now() + snapshotRetryDelayMs < deadline) {
-            await delay(snapshotRetryDelayMs)
+          if (navigatedDuringCapture && !options.diff && navigationRetries < 3 && Date.now() + snapshotRetryDelayMs < deadline) {
+            navigationRetries++
+            settleAttempts = 0
+            await waitForNavigationSettle()
             continue
           }
-          if (result.needsSettle && !options.diff && captureAttempts < 3 && Date.now() + 120 < deadline) {
-            captureAttempts++
+          if (result.needsSettle && !options.diff && settleAttempts < 3 && Date.now() + 120 < deadline) {
+            settleAttempts++
             const initialWait = result.hasLoadingIndicator ? 1200 : 320
             await page.evaluate(`new Promise((resolve) => {
               const isLoading = () => Boolean(
@@ -1249,6 +1281,11 @@ return (${capture.toString()})(rootOrSettings, locatorSettings)`,
                 done();
               }
             })`).catch(() => {})
+            if (navigatedDuringCapture && navigationRetries < 3 && Date.now() + snapshotRetryDelayMs < deadline) {
+              navigationRetries++
+              settleAttempts = 0
+              await waitForNavigationSettle()
+            }
             continue
           }
           break
@@ -1258,10 +1295,14 @@ return (${capture.toString()})(rootOrSettings, locatorSettings)`,
             break
           }
           const kind = runtimeFailureKind(error)
-          if ((kind === "context-destroyed" || kind === "context-missing") && !options.diff && Date.now() + snapshotRetryDelayMs < deadline) {
-            await delay(snapshotRetryDelayMs)
+          if ((kind === "context-destroyed" || kind === "context-missing") && !options.diff && navigationRetries < 3 && Date.now() + snapshotRetryDelayMs < deadline) {
+            navigationRetries++
+            settleAttempts = 0
+            await waitForNavigationSettle()
             continue
           }
+          removeNavigationListener()
+          delete registry.removeNavigationListener
           throw error
         }
       }
@@ -1551,7 +1592,7 @@ export async function fillInput(options: { readonly page: Page; readonly target:
     }
     element.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: nextValue }))
     element.dispatchEvent(new Event("change", { bubbles: true }))
-  }, options.value, { timeout: 30_000 })
+  }, options.value, { timeout: 8_000 })
 }
 
 export async function fillInputs(page: Page, fields: ReadonlyArray<InputField>): Promise<void> {

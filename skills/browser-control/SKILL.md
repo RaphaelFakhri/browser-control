@@ -259,7 +259,9 @@ now identifies its replacement.
 Tell the user what action is waiting. Human acknowledgment is not verification:
 always assert the expected URL or stable element after `handoff`. If the action
 was already completed and only the human step remains, call `handoff(message)`
-without `start`. The default timeout is ten minutes.
+without `start`. The default timeout is ten minutes. Do not call `await handoff(...)`
+in an unattended background subagent unless the user has already been notified
+and is watching the browser tab.
 
 Completion: the prompt was presented only after WAIT was registered, the action
 settled, and the authenticated result was independently verified.
@@ -368,8 +370,16 @@ diffs include visible page content: inspect for private information before shari
 ## Execute Interface
 
 Execute code can use `page`, `context`, `browser`, persistent `state`, selected
-Node modules through `modules` and aliases such as `fs` and `path`, plus the
-Browser Control helpers documented here. Execute code runs in Node. Use
+Node modules through `modules` and aliases such as `fs`, `fsp` (`fs.promises`),
+and `path` (`fs` methods also return a Promise when called without a callback,
+so `await fs.readFile(...)` and `await fs.writeFile(...)` work alongside
+`fs.readFileSync(...)`), plus the
+Browser Control helpers documented here. Default Playwright action/locator
+timeout is 8,000ms and navigation timeout is 30,000ms (pass `{ timeout }` or
+`page.setDefaultTimeout(...)` to override). If a session's default tab was closed
+and replaced with `about:blank`, locator actions and `snapshot()` fail immediately
+until `page.goto(...)`, `page.reload()`, or tab adoption navigates the page.
+Execute code runs in Node. Use
 `page.evaluate` for `window`, `document`, storage, and same-origin `fetch`
 with page cookies. Single expressions auto-return;
 multi-statement scripts need `return`. Use `--file` for longer scripts:

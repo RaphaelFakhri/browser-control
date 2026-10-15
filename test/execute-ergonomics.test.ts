@@ -828,6 +828,39 @@ describe("snapshot helpers", () => {
     expect(registry.selectors.size).toBe(0)
     expect(() => helpers.ref("e1")).toThrow("Snapshot refs are stale")
   })
+
+  it("waits for domcontentloaded and retries automatically when the page navigates once during capture", async () => {
+    let onFrameNavigated: ((frame: unknown) => void) | undefined
+    const mainFrame = {}
+    let callCount = 0
+    const waitForLoadState = vi.fn().mockResolvedValue(undefined)
+    const page = {
+      evaluate: vi.fn(async () => {
+        if (++callCount === 1) {
+          onFrameNavigated?.(mainFrame)
+        }
+        return {
+          entries: [{ depth: 0, role: "button", name: "Continue", identityName: "Continue", selector: "#continue" }],
+          truncated: false,
+        }
+      }),
+      waitForLoadState,
+      locator: vi.fn(() => ({ and: vi.fn((roleLoc: unknown) => roleLoc) })),
+      getByRole: vi.fn(() => ({})),
+      url: vi.fn(() => "https://example.com/settled"),
+      mainFrame: vi.fn(() => mainFrame),
+      on: vi.fn((event: string, handler: (frame: unknown) => void) => {
+        if (event === "framenavigated") onFrameNavigated = handler
+      }),
+      off: vi.fn(),
+    } as unknown as Page
+    const registry = { selectors: new Map() }
+    const helpers = createSnapshotHelpers(page, registry)
+
+    await expect(helpers.snapshot()).resolves.toBe('- button "Continue" [ref=e1]')
+    expect(waitForLoadState).toHaveBeenCalledWith("domcontentloaded", expect.objectContaining({ timeout: expect.any(Number) }))
+    expect(registry.selectors.size).toBe(1)
+  })
 })
 
 describe("pageTargetId", () => {
